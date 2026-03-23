@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Budget" />
+  <meta name="theme-color" content="#0D1B22" />
+  <title>Budget Planner</title>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0D1B22; color: #E8F4F8; font-family: "DM Sans", "Segoe UI", sans-serif; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
+    input[type=number] { -moz-appearance: textfield; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(126,184,201,0.2); border-radius: 2px; }
+    .sync-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; vertical-align: middle; }
+  </style>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIREBASE CONFIG
+// ════════════════════════════════════════════════════════════════════════════
+// When you're ready to set up Firebase, replace each placeholder below with
+// the real values from Firebase Console → Project Settings → Your apps.
+// Until then the app works perfectly with local storage only.
+const FIREBASE_CONFIG = {
+  apiKey:            "REPLACE_WITH_YOUR_API_KEY",
+  authDomain:        "REPLACE_WITH_YOUR_AUTH_DOMAIN",
+  projectId:         "REPLACE_WITH_YOUR_PROJECT_ID",
+  storageBucket:     "REPLACE_WITH_YOUR_STORAGE_BUCKET",
+  messagingSenderId: "REPLACE_WITH_YOUR_MESSAGING_SENDER_ID",
+  appId:             "REPLACE_WITH_YOUR_APP_ID",
+};
+// ════════════════════════════════════════════════════════════════════════════
+
+const FIREBASE_READY = FIREBASE_CONFIG.apiKey !== "REPLACE_WITH_YOUR_API_KEY";
+
+// ── Firebase loader (dynamic import so it doesn't break without config) ────
+let fbPromise = null;
+function getFirebase() {
+  if (!FIREBASE_READY) return Promise.resolve(null);
+  if (fbPromise) return fbPromise;
+  fbPromise = (async () => {
+    const [{ initializeApp }, { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut },
+           { getFirestore, doc, setDoc, getDoc }] = await Promise.all([
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js"),
+    ]);
+    const app  = initializeApp(FIREBASE_CONFIG);
+    const auth = getAuth(app);
+    const db   = getFirestore(app);
+    return {
+      auth, db, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut,
+      save: (uid, data) => setDoc(doc(db, "users", uid), { budget: JSON.stringify(data) }),
+      load: async (uid) => { const s = await getDoc(doc(db, "users", uid)); return s.exists() ? JSON.parse(s.data().budget) : null; },
+    };
+  })();
+  return fbPromise;
+}
+
+// ── Sync hook ───────────────────────────────────────────────────────────────
+function useSync(state, setState) {
+  const [user,       setUser]       = useState(null);
+  const [status,     setStatus]     = useState("local");
+  const [conflict,   setConflict]   = useState(null); // { remote, remoteTs, localTs }
+  const saveTimer                   = useRef(null);
+  const firstLoad                   = useRef(true);
+  const currentUser                 = useRef(null);
+
+  useEffect(() => {
+    if (!FIREBASE_READY) return;
+    let unsub;
+    getFirebase().then(fb => {
+      unsub = fb.onAuthStateChanged(fb.auth, async u => {
+        setUser(u);
+        currentUser.current = u;
+        if (u) {
+          setStatus("syncing");
+          try {
+            const remote = await fb.load(u.uid);
+            if (remote) {
+              const remoteTs = remote._savedAt || 0;
+              const localTs  = state._savedAt  || 0;
+              if (remoteTs > localTs + 5000) {
+                // Remote is meaningfully newer — ask user
+                setConflict({ remote, remoteTs, localTs });
+                setStatus("synced");
+              } else {
+                setState(s => ({ ...s, ...remote }));
+                setStatus("synced");
+              }
+            } else {
+              setStatus("synced");
+            }
+          } catch { setStatus("error"); }
+        } else { setStatus("local"); }
+      });
+    });
+    return () => unsub && unsub();
+  }, []);
+
+  useEffect(() => {
+    // Always save to localStorage
+    try { localStorage.setItem("budget-planner-v1", JSON.stringify(state)); } catch {}
+    // Firebase save (debounced)
+    if (!FIREBASE_READY || !currentUser.current || firstLoad.current) { firstLoad.current = false; return; }
+    clearTimeout(saveTimer.current);
+    setStatus("syncing");
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const withTs = { ...state, _savedAt: Date.now() };
+        await (await getFirebase()).save(currentUser.current.uid, withTs);
+        setStatus("synced");
+      } catch { setStatus("error"); }
+    }, 1500);
+  }, [state]);
+
+  const resolveConflict = (useRemote) => {
+    if (useRemote) setState(s => ({ ...s, ...conflict.remote }));
+    setConflict(null);
+  };
+
+  const signIn = async () => {
+    const fb = await getFirebase();
+    await fb.signInWithPopup(fb.auth, new fb.GoogleAuthProvider()).catch(console.error);
+  };
+  const signOutFn = async () => { const fb = await getFirebase(); fb.signOut(fb.auth); };
+  return { user, status, signIn, signOut: signOutFn, conflict, resolveConflict };
+}
+
+// ── Sync bar UI ─────────────────────────────────────────────────────────────
+function SyncBar({ user, status, signIn, signOut, conflict, resolveConflict }) {
+  if (!FIREBASE_READY) return (
+    <div style={{ padding: "5px 20px", background: "rgba(0,0,0,0.4)", fontSize: 10, color: "#2A4A5A", letterSpacing: "0.05em" }}>
+      <span className="sync-dot" style={{ background: "#2A4A5A" }} />
+      Local storage only — Firebase not configured yet
+    </div>
+  );
+
+  if (conflict) {
+    const fmt = (ts) => ts ? new Date(ts).toLocaleString("en-GB", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" }) : "unknown";
+    return (
+      <div style={{ padding: "12px 20px", background: "rgba(192,160,64,0.15)", borderBottom: "1px solid rgba(192,160,64,0.3)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#C0A060", marginBottom: 3 }}>⚠️ Newer data found on another device</div>
+          <div style={{ fontSize: 10, color: "#7A6040" }}>
+            Remote: saved {fmt(conflict.remoteTs)} &nbsp;·&nbsp; This device: saved {fmt(conflict.localTs)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <button onClick={() => resolveConflict(true)}
+            style={{ fontSize: 11, color: "#E8F4F8", background: "rgba(192,160,64,0.4)", border: "1px solid rgba(192,160,64,0.6)", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontWeight: 700 }}>
+            Load remote
+          </button>
+          <button onClick={() => resolveConflict(false)}
+            style={{ fontSize: 11, color: "#7A6040", background: "rgba(0,0,0,0.2)", border: "1px solid rgba(192,160,64,0.3)", borderRadius: 6, padding: "5px 12px", cursor: "pointer" }}>
+            Keep this device
+          </button>
+        </div>
+      </div>
+    );
+  }
+  if (!user) return (
+    <div style={{ padding: "5px 20px", background: "rgba(0,0,0,0.4)", fontSize: 11, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <span style={{ color: "#3A6A7A" }}>
+        <span className="sync-dot" style={{ background: "#3A6A7A" }} />Not signed in — data on this device only
+      </span>
+      <button onClick={signIn} style={{ fontSize: 11, color: "#7EB8C9", background: "rgba(126,184,201,0.1)", border: "1px solid rgba(126,184,201,0.3)", borderRadius: 5, padding: "3px 10px", cursor: "pointer" }}>
+        Sign in with Google
+      </button>
+    </div>
+  );
+  const dot   = status === "synced" ? "#76C09A" : status === "syncing" ? "#C0A060" : "#E07070";
+  const label = status === "synced" ? "Synced" : status === "syncing" ? "Saving…" : "Sync error";
+  return (
+    <div style={{ padding: "5px 20px", background: "rgba(0,0,0,0.4)", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <span style={{ color: "#5A8090" }}>
+        <span className="sync-dot" style={{ background: dot }} />{label} · {user.displayName || user.email}
+      </span>
+      <button onClick={signOut} style={{ fontSize: 10, color: "#3A6A7A", background: "none", border: "none", cursor: "pointer" }}>Sign out</button>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// APP CODE (auto-generated from BudgetPlanner.jsx)
+// ════════════════════════════════════════════════════════════════════════════
+
+const STORAGE_KEY = "budget-planner-v1";
+
+// Polish public holidays (fixed dates + Easter-based for 2025 & 2026)
+// Format: [month (0-indexed), day]
+const POLISH_HOLIDAYS_FIXED = [
+  [0, 1],   // New Year's Day
+  [0, 6],   // Epiphany (Three Kings)
+  [4, 1],   // Labour Day
+  [4, 3],   // Constitution Day
+  [7, 15],  // Assumption Day
+  [10, 1],  // All Saints' Day
+  [10, 11], // Independence Day
+  [11, 25], // Christmas Day
+  [11, 26], // Second Christmas Day
+];
+
+// Easter Sunday per year
+const EASTER = { 2025: [3, 20], 2026: [3, 5], 2027: [3, 28] };
+
+function getPolishHolidaysForMonth(year, month) {
+  const easter = EASTER[year] || EASTER[2026];
+  const easterDate = new Date(year, easter[0], easter[1]);
+  const easterMonday = new Date(easterDate); easterMonday.setDate(easterDate.getDate() + 1);
+  const pentecost  = new Date(easterDate); pentecost.setDate(easterDate.getDate() + 49);
+  const corpusChristi = new Date(easterDate); corpusChristi.setDate(easterDate.getDate() + 60);
+
+  const movable = [easterDate, easterMonday, pentecost, corpusChristi];
+  const fixed = POLISH_HOLIDAYS_FIXED.map(([m, d]) => new Date(year, m, d));
+  const all = [...fixed, ...movable];
+
+  return all.filter(d => {
+    if (d.getMonth() !== month) return false;
+    const dow = d.getDay();
+    return dow !== 0 && dow !== 6; // only count weekday holidays
+  }).length;
+}
+
+function getWorkingDaysInMonth(year, month) {
+  const days = new Date(year, month + 1, 0).getDate();
+  let count = 0;
+  for (let d = 1; d <= days; d++) {
+    const dow = new Date(year, month, d).getDay();
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
+// 2025 fixed contributions (pełny ZUS)
+const ZUS_SPOLECZNE = 1773.96;
+// Health insurance brackets 2025 (ryczałt)
+const HEALTH_BRACKETS = [461.66, 769.43, 1384.97];
+
+const defaultState = {
+  income: { hourlyRate: 170, partner: 0, other: 0 },
+  payDay: 14,
+  vacationDays: 0,
+  taxConfig: {
+    ryczaltRate: 8.5,
+    healthBracket: 3,
+    zusEnabled: true,
+  },
+  housing: {
+    rent: 0, propertyTax: 0, homeInsurance: 0, electricity: 0,
+    gas: 0, water: 0, internet: 0, maintenance: 0, furniture: 0, otherHousing: 0,
+    carLoan: 0, fuel: 0, carInsurance: 0, roadTax: 0, publicTransport: 0, parking: 0, carService: 0,
+  },
+  food: {
+    groceries: 0, kidsFood: 0, specialty: 0, mealKits: 0,
+    coffee: 0, restaurants: 0, workLunches: 0, alcohol: 0, otherFood: 0,
+  },
+  regular: {
+    streamingVideo: 0, streamingMusic: 0, gaming: 0, news: 0, cloud: 0, software: 0, gym: 0, sub8: 0, sub9: 0,
+    sportsAdult: 0, classesAdult: 0, eventsAdult: 0, otherAdult: 0,
+    schoolFees: 0, afterSchool: 0, sportsKid1: 0, sportsKid2: 0, musicArts: 0, schoolTrips: 0, otherKids: 0,
+    clothing: 0, haircuts: 0, healthcare: 0, gifts: 0, pets: 0, otherMisc: 0,
+  },
+  savings: {
+    emergency: 0, holiday: 0, renovation: 0, car: 0, education: 0,
+    retirement: 0, gadget: 0, goal8: 0, goal9: 0, goal10: 0,
+    indexFund: 0, stocks: 0, pension: 0, otherInv: 0,
+  },
+  savingsTargets: {
+    emergency: 0, holiday: 0, renovation: 0, car: 0, education: 0,
+    retirement: 0, gadget: 0, goal8: 0, goal9: 0, goal10: 0,
+  },
+  safeToSpend: { bankBalance: 0, paidItems: {}, lastResetMonth: -1 },
+  labels: {},
+  showZeros: {},
+  company: {
+    accountancy: 0, bankFees: 0, officeRent: 0, phone: 0, internet: 0,
+    software: 0, hosting: 0, equipment: 0, insurance: 0, marketing: 0,
+    training: 0, travel: 0, fuel: 0, meals: 0, other1: 0, other2: 0,
+  },
+};
+
+const TABS = ["Dashboard", "Company", "Housing", "Food", "Regular", "Savings", "Safe to Spend"];
+const TAB_ICONS = ["◈", "briefcase", "⌂", "◎", "≡", "◇", "✦"];
+
+function num(v) { return parseFloat(v) || 0; }
+function fmt(v, showSign = false) {
+  const abs = Math.abs(v);
+  const str = abs.toLocaleString("pl-PL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (showSign && v > 0) return `+${str} zł`;
+  if (v < 0) return `-${str} zł`;
+  return `${str} zł`;
+}
+
+function Input({ value, onChange, placeholder = "0.00", prefix = "zł", suffix = false }) {
+  return (
+    <div style={{ position: "relative", display: "inline-flex", alignItems: "center", width: "100%" }}>
+      {!suffix && <span style={{ position: "absolute", left: 10, color: "#7EB8C9", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>{prefix}</span>}
+      <input
+        type="number"
+        value={value || ""}
+        onChange={e => onChange(parseFloat(e.target.value) || 0)}
+        placeholder={placeholder}
+        style={{
+          width: "100%", background: "rgba(126,184,201,0.08)", border: "1px solid rgba(126,184,201,0.25)",
+          borderRadius: 6, padding: suffix ? "7px 30px 7px 8px" : "7px 8px 7px 26px", color: "#E8F4F8", fontSize: 13,
+          fontFamily: "monospace", outline: "none", boxSizing: "border-box",
+          transition: "border-color 0.2s",
+        }}
+        onFocus={e => e.target.style.borderColor = "rgba(126,184,201,0.7)"}
+        onBlur={e => e.target.style.borderColor = "rgba(126,184,201,0.25)"}
+      />
+      {suffix && <span style={{ position: "absolute", right: 8, color: "#7EB8C9", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>{prefix}</span>}
+    </div>
+  );
+}
+
+function SmartRow({ defaultLabel, field, section, state, setState, note, showZero }) {
+  const [editing, setEditing] = useState(false);
+  const labelKey = `${section}_${field}`;
+  const customLabel = state.labels?.[labelKey];
+  const label = customLabel || defaultLabel;
+  const value = num(state[section]?.[field]);
+  const isZero = value === 0;
+  if (isZero && !showZero) return null; // safe — useState already called above
+
+  const updateValue = v => setState(s => ({ ...s, [section]: { ...s[section], [field]: v } }));
+  const updateLabel = v => setState(s => ({ ...s, labels: { ...s.labels, [labelKey]: v } }));
+
+  return (
+    <div style={{
+      display: "grid", gridTemplateColumns: "1fr 140px 26px", gap: 6, alignItems: "center",
+      padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.04)",
+    }}>
+      <div style={{ minWidth: 0 }}>
+        {editing ? (
+          <input
+            autoFocus
+            defaultValue={label}
+            onBlur={e => { updateLabel(e.target.value || defaultLabel); setEditing(false); }}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === "Escape") e.target.blur(); }}
+            style={{
+              width: "100%", background: "rgba(126,184,201,0.12)", border: "1px solid rgba(126,184,201,0.5)",
+              borderRadius: 4, padding: "3px 6px", color: "#E8F4F8", fontSize: 13, outline: "none",
+              fontFamily: "inherit",
+            }}
+          />
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 5, cursor: "text" }} onClick={() => setEditing(true)}>
+            <span style={{ fontSize: 13, color: isZero ? "#3A5A6A" : "#C8DDE5" }}>{label}</span>
+            <span style={{ fontSize: 9, color: "#2A4A5A", opacity: 0, transition: "opacity 0.15s" }}
+              className="edit-hint">✎</span>
+          </div>
+        )}
+        {note && !editing && <div style={{ fontSize: 10, color: "#2A4A5A", marginTop: 1 }}>{note}</div>}
+      </div>
+      <Input value={value || ""} onChange={updateValue} prefix="zł" suffix />
+      {/* Clear button — only shown when value > 0 */}
+      <button
+        onClick={() => updateValue(0)}
+        title="Clear"
+        style={{
+          width: 22, height: 22, borderRadius: 4, border: "1px solid rgba(192,64,64,0.25)",
+          background: "transparent", color: "#6A3A3A", cursor: "pointer", fontSize: 11,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          opacity: value > 0 ? 1 : 0, pointerEvents: value > 0 ? "auto" : "none",
+          flexShrink: 0,
+        }}
+      >✕</button>
+    </div>
+  );
+}
+
+// Legacy Row shim — keeps savings tab working unchanged
+function Row({ label, field, section, state, update, note }) {
+  return (
+    <SmartRow defaultLabel={label} field={field} section={section} state={state}
+      setState={fn => { const next = fn(state); update(section, field, next[section][field]); }}
+      note={note} showZero={true} />
+  );
+}
+
+function SectionHeader({ title, color = "#7EB8C9" }) {
+  return (
+    <div style={{ marginTop: 20, marginBottom: 8, paddingBottom: 4, borderBottom: `1px solid ${color}40` }}>
+      <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.12em", color, textTransform: "uppercase" }}>{title}</span>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, color = "#7EB8C9", big = false }) {
+  return (
+    <div style={{
+      background: "rgba(126,184,201,0.06)", border: "1px solid rgba(126,184,201,0.15)",
+      borderRadius: 10, padding: "14px 16px", position: "relative", overflow: "hidden",
+    }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "#5A8090", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: big ? 26 : 20, fontWeight: 700, color, fontFamily: "monospace", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: "#5A8090", marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function SplitBar({ label, pct, budgetPct, color }) {
+  const ideal = Math.round(pct * 100);
+  const actual = Math.min(Math.round(budgetPct * 100), 100);
+  const over = budgetPct > pct;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 12 }}>
+        <span style={{ color: "#C8DDE5" }}>{label}</span>
+        <span style={{ color: over ? "#E07070" : "#7EB8C9", fontFamily: "monospace" }}>
+          {Math.round(budgetPct * 100)}% <span style={{ color: "#3A5A6A" }}>/ {ideal}% ideal</span>
+        </span>
+      </div>
+      <div style={{ position: "relative", height: 8, borderRadius: 4, background: "rgba(255,255,255,0.06)" }}>
+        <div style={{ position: "absolute", left: 0, top: 0, height: "100%", borderRadius: 4, width: `${actual}%`, background: over ? "#C04040" : color, transition: "width 0.5s ease", opacity: 0.85 }} />
+        <div style={{ position: "absolute", top: -2, height: 12, width: 2, background: "#7EB8C9", borderRadius: 1, left: `${ideal}%`, opacity: 0.6 }} />
+      </div>
+    </div>
+  );
+}
+
+function SavingsGoalRow({ f, defaultL, state, setState, update, showZero }) {
+  const [editingL, setEditingL] = useState(false);
+  const val = num(state.savings?.[f]);
+  const labelKey = `savings_${f}`;
+  const label = state.labels?.[labelKey] || defaultL;
+
+  if (val === 0 && !showZero) return null;
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 100px 120px 26px", gap: 6, alignItems: "center", padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+      {editingL ? (
+        <input autoFocus defaultValue={label}
+          onBlur={e => { setState(s => ({ ...s, labels: { ...s.labels, [labelKey]: e.target.value || defaultL } })); setEditingL(false); }}
+          onKeyDown={e => { if (e.key === "Enter" || e.key === "Escape") e.target.blur(); }}
+          style={{ background: "rgba(126,184,201,0.12)", border: "1px solid rgba(126,184,201,0.5)", borderRadius: 4, padding: "3px 6px", color: "#E8F4F8", fontSize: 13, outline: "none", fontFamily: "inherit" }}
+        />
+      ) : (
+        <span style={{ fontSize: 13, color: val === 0 ? "#3A5A6A" : "#C8DDE5", cursor: "text" }} onClick={() => setEditingL(true)}>{label}</span>
+      )}
+      <Input value={val || ""} onChange={v => update("savings", f, v)} prefix="zł" suffix />
+      <Input value={state.savingsTargets?.[f] || ""} onChange={v => update("savingsTargets", f, v)} prefix="zł" suffix />
+      <button onClick={() => { update("savings", f, 0); update("savingsTargets", f, 0); }}
+        style={{ width: 22, height: 22, borderRadius: 4, border: "1px solid rgba(192,64,64,0.25)", background: "transparent", color: "#6A3A3A", cursor: "pointer", fontSize: 11, display: "flex", alignItems: "center", justifyContent: "center", opacity: val > 0 ? 1 : 0, pointerEvents: val > 0 ? "auto" : "none", flexShrink: 0 }}>✕</button>
+    </div>
+  );
+}
+
+function App({ __externalState__, __externalSetState__ }) {
+  const [localState, setLocalState] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) return { ...defaultState, ...JSON.parse(saved) };
+    } catch {}
+    return defaultState;
+  });
+  const state    = __externalState__    || localState;
+  const setState = __externalSetState__ || setLocalState;
+  const [tab, setTab] = useState(0);
+
+  // Auto-reset paid items when we enter a new pay cycle
+  useEffect(() => {
+    const month = new Date().getMonth();
+    if (state.safeToSpend.lastResetMonth !== month) {
+      setState(s => ({
+        ...s,
+        safeToSpend: { ...s.safeToSpend, paidItems: {}, lastResetMonth: month }
+      }));
+    }
+  }, []);
+
+  const update = useCallback((section, field, value) => {
+    setState(s => ({ ...s, [section]: { ...s[section], [field]: value } }));
+  }, []);
+
+  // ── Income calculation ──
+  const today = new Date();
+  const currentYear = today.getFullYear();
+  const currentMonth = today.getMonth();
+
+  const hourlyRate = num(state.income.hourlyRate);
+  const vacationDays = num(state.vacationDays);
+  const hoursPerDay = 8;
+  const workingDays = getWorkingDaysInMonth(currentYear, currentMonth);
+  const publicHolidays = getPolishHolidaysForMonth(currentYear, currentMonth);
+  const billableDays = Math.max(0, workingDays - publicHolidays - vacationDays);
+
+  // Gross revenue (netto, VAT excluded — VAT is pass-through)
+  const grossRevenue = billableDays * hoursPerDay * hourlyRate;
+  const vatAmount = grossRevenue * 0.23;
+
+  // Deductions
+  const { ryczaltRate, healthBracket, zusEnabled } = state.taxConfig || {};
+  const zusSpoleczne = zusEnabled !== false ? ZUS_SPOLECZNE : 0;
+  const healthIns    = HEALTH_BRACKETS[Math.min(Math.max(num(healthBracket) - 1, 0), 2)];
+  const ryczaltTax   = grossRevenue * (num(ryczaltRate) / 100);
+  const totalDeductions = zusSpoleczne + healthIns + ryczaltTax;
+
+  // Net take-home from main activity
+  const calculatedSalary = Math.max(0, grossRevenue - totalDeductions);
+  const totalIncome = calculatedSalary + num(state.income.partner) + num(state.income.other);
+  const totalHousing = Object.values(state.housing).reduce((a, v) => a + num(v), 0);
+  const totalFood = Object.values(state.food).reduce((a, v) => a + num(v), 0);
+  const totalRegular = Object.values(state.regular).reduce((a, v) => a + num(v), 0);
+  const totalSavings = Object.values(state.savings).reduce((a, v) => a + num(v), 0);
+  const totalCompany = Object.values(state.company).reduce((a, v) => a + num(v), 0);
+  const totalBudgeted = totalHousing + totalFood + totalRegular + totalSavings;
+  const remaining = totalIncome - totalBudgeted;
+
+  // ── 50/30/20 — percentages of total budgeted spend ──
+  const needs = totalHousing + totalFood;
+  const wants = totalRegular;
+  const savingsTotal = totalSavings;
+  const needsPct    = totalBudgeted > 0 ? needs        / totalBudgeted : 0;
+  const wantsPct    = totalBudgeted > 0 ? wants        / totalBudgeted : 0;
+  const savingsPct  = totalBudgeted > 0 ? savingsTotal / totalBudgeted : 0;
+
+  // ── Safe to Spend ──
+  const payDay = Math.max(1, Math.min(28, Math.round(num(state.payDay) || 1)));
+  const thisMonth = currentMonth;
+  const thisYear = currentYear;
+  let nextPayDate = new Date(thisYear, thisMonth, payDay);
+  if (nextPayDate <= today) nextPayDate = new Date(thisYear, thisMonth + 1, payDay);
+  const daysUntilPay = Math.ceil((nextPayDate - today) / (1000 * 60 * 60 * 24));
+  const daysInCycle = payDay === 1
+    ? new Date(thisYear, thisMonth + 1, 0).getDate()
+    : 30;
+
+  // ── Build budget checklist & handle monthly reset ──
+  const BUDGET_ITEMS = [
+    // [id, label, section, field, category]
+    ...Object.entries({
+      rent:"Rent/Mortgage", propertyTax:"Property Tax", homeInsurance:"Home Insurance",
+      electricity:"Electricity", gas:"Gas/Heating", water:"Water", internet:"Internet",
+      maintenance:"Home Maintenance", furniture:"Furniture/Appliances", otherHousing:"Other Housing",
+      carLoan:"Car Loan/Lease", fuel:"Fuel", carInsurance:"Car Insurance",
+      roadTax:"Road Tax", publicTransport:"Public Transport", parking:"Parking", carService:"Car Service",
+    }).map(([f,l]) => ({ id:`housing_${f}`, label:l, amount: num(state.housing[f]), category:"🏠 Housing" })),
+    ...Object.entries({
+      groceries:"Groceries", kidsFood:"Kids Food", specialty:"Specialty/Organic",
+      mealKits:"Meal Kits", coffee:"Coffee & Bakeries", restaurants:"Restaurants",
+      workLunches:"Work Lunches", alcohol:"Alcohol/Wine", otherFood:"Other Food",
+    }).map(([f,l]) => ({ id:`food_${f}`, label:l, amount: num(state.food[f]), category:"🛒 Food" })),
+    ...Object.entries({
+      streamingVideo:"Streaming Video", streamingMusic:"Streaming Music", gaming:"Gaming/Apps",
+      news:"News/Magazines", cloud:"Cloud Storage", software:"Software/SaaS", gym:"Gym",
+      sub8:"Subscription 8", sub9:"Subscription 9",
+      sportsAdult:"Sports/Hobby", classesAdult:"Classes/Courses", eventsAdult:"Events/Concerts", otherAdult:"Other Adult",
+      schoolFees:"School Fees", afterSchool:"After-School", sportsKid1:"Sports Kid 1",
+      sportsKid2:"Sports Kid 2", musicArts:"Music/Arts", schoolTrips:"School Trips", otherKids:"Other Kids",
+      clothing:"Clothing/Shoes", haircuts:"Haircuts/Grooming", healthcare:"Healthcare",
+      gifts:"Gifts", pets:"Pet Care", otherMisc:"Other Misc",
+    }).map(([f,l]) => ({ id:`regular_${f}`, label:l, amount: num(state.regular[f]), category:"📋 Regular" })),
+    ...Object.entries({
+      emergency:"Emergency Fund", holiday:"Holiday/Travel", renovation:"Home Renovation",
+      car:"New Car", education:"Education", retirement:"Retirement", gadget:"Gadget",
+      goal8:"Goal 8", goal9:"Goal 9", goal10:"Goal 10",
+      indexFund:"Index Fund/ETF", stocks:"Stocks", pension:"Pension", otherInv:"Other Investment",
+    }).map(([f,l]) => ({ id:`savings_${f}`, label:l, amount: num(state.savings[f]), category:"🎯 Savings" })),
+    ...Object.entries({
+      accountancy:"Accountancy", bankFees:"Bank Fees", officeRent:"Office/Coworking",
+      phone:"Phone Plan", internet:"Internet (biz)", software:"Software (biz)", hosting:"Hosting",
+      equipment:"Equipment", insurance:"Business Insurance", marketing:"Marketing",
+      training:"Training", travel:"Business Travel", fuel:"Fuel (biz)", meals:"Client Meals",
+      other1:"Other Company 1", other2:"Other Company 2",
+    }).map(([f,l]) => ({ id:`company_${f}`, label:l, amount: num(state.company[f]), category:"💼 Company" })),
+  ].filter(item => item.amount > 0);
+
+  // Auto-reset paidItems when we cross payday into a new cycle
+  const currentCycleMonth = today.getMonth();
+  if (state.safeToSpend.lastResetMonth !== currentCycleMonth) {
+    // We're in a new month — trigger reset on next render via useEffect
+  }
+
+  const paidItems = state.safeToSpend.paidItems || {};
+  const totalAlreadyPaid = BUDGET_ITEMS.reduce((sum, item) => {
+    const paid = paidItems[item.id];
+    if (!paid) return sum;
+    return sum + (paid.partial !== undefined ? num(paid.partial) : item.amount);
+  }, 0);
+
+  const unpaidFixedCosts = BUDGET_ITEMS
+    .filter(item => ["🏠 Housing","🛒 Food","🎯 Savings"].includes(item.category))
+    .reduce((sum, item) => {
+      const paid = paidItems[item.id];
+      if (!paid) return sum + item.amount;
+      return sum + item.amount - (paid.partial !== undefined ? num(paid.partial) : item.amount);
+    }, 0);
+
+  // Prorate only unpaid fixed costs for remaining days
+  const dailyFixedCosts = unpaidFixedCosts / daysInCycle;
+  const proRatedUntilPay = dailyFixedCosts * daysUntilPay;
+  const bankBalance = num(state.safeToSpend.bankBalance);
+  const safeTotal = Math.max(0, bankBalance - proRatedUntilPay);
+  const safePerDay = daysUntilPay > 0 ? safeTotal / daysUntilPay : 0;
+
+  const styles = {
+    app: {
+      minHeight: "100vh", background: "#0D1B22",
+      fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
+      color: "#E8F4F8",
+      backgroundImage: "radial-gradient(ellipse at 20% 0%, rgba(30,70,90,0.4) 0%, transparent 60%), radial-gradient(ellipse at 80% 100%, rgba(15,45,60,0.3) 0%, transparent 60%)",
+    },
+    header: {
+      padding: "24px 24px 0",
+      borderBottom: "1px solid rgba(126,184,201,0.12)",
+      marginBottom: 0,
+    },
+    title: { fontSize: 22, fontWeight: 800, letterSpacing: "-0.02em", color: "#E8F4F8", marginBottom: 2 },
+    subtitle: { fontSize: 12, color: "#3A6A7A", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 16 },
+    tabs: { display: "flex", gap: 2, overflowX: "auto" },
+    tab: (active) => ({
+      padding: "8px 14px", fontSize: 12, fontWeight: active ? 700 : 400,
+      color: active ? "#7EB8C9" : "#3A6A7A", background: "none", border: "none",
+      borderBottom: active ? "2px solid #7EB8C9" : "2px solid transparent",
+      cursor: "pointer", whiteSpace: "nowrap", letterSpacing: "0.04em",
+      transition: "all 0.15s", outline: "none",
+    }),
+    body: { padding: "20px 24px 40px", maxWidth: 680, margin: "0 auto" },
+  };
+
+  const renderDashboard = () => {
+    const monthName = today.toLocaleString("en-GB", { month: "long", year: "numeric" });
+    return (
+    <div>
+      {/* Income */}
+      <SectionHeader title="Monthly Income" />
+
+      {/* Hourly rate calculator */}
+      <div style={{ background: "rgba(126,184,201,0.06)", border: "1px solid rgba(126,184,201,0.15)", borderRadius: 10, padding: "14px 16px", marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: "#5A8090", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          Main Income — Hourly Rate · {monthName}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4 }}>Hourly Rate (netto)</div>
+            <Input value={state.income.hourlyRate} onChange={v => update("income", "hourlyRate", v)} prefix="zł/h" suffix />
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4 }}>Vacation Days This Month</div>
+            <Input value={state.vacationDays} onChange={v => setState(s => ({ ...s, vacationDays: v }))} prefix="days" suffix placeholder="0" />
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4 }}>Public Holidays (weekdays)</div>
+            <div style={{ padding: "7px 10px", background: "rgba(126,184,201,0.04)", border: "1px solid rgba(126,184,201,0.12)", borderRadius: 6, fontSize: 13, fontFamily: "monospace", color: "#7EB8C9" }}>
+              {publicHolidays} days
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+          {[
+            ["Working Days", workingDays, "#5A8090"],
+            ["Public Holidays", publicHolidays, "#C0A060"],
+            ["Vacation Days", vacationDays, "#A080C0"],
+            ["Billable Days", billableDays, "#76C09A"],
+          ].map(([l, v, c]) => (
+            <div key={l} style={{ background: "rgba(0,0,0,0.15)", borderRadius: 6, padding: "8px 10px", textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: "#3A5A6A", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 2 }}>{l}</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: c, fontFamily: "monospace" }}>{v}</div>
+            </div>
+          ))}
+        </div>
+        {/* Gross total row */}
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(126,184,201,0.1)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: "#3A6A7A" }}>
+            {billableDays} days × 8h × {num(hourlyRate).toLocaleString("pl-PL", {minimumFractionDigits:2, maximumFractionDigits:2})} zł/h = gross revenue
+          </span>
+          <span style={{ fontSize: 14, fontFamily: "monospace", color: "#C8DDE5" }}>{fmt(grossRevenue)}</span>
+        </div>
+      </div>
+
+      {/* Deductions breakdown */}
+      <div style={{ background: "rgba(192,96,64,0.06)", border: "1px solid rgba(192,96,64,0.15)", borderRadius: 10, padding: "14px 16px", marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: "#9A5040", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          Deductions (monthly)
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", rowGap: 5 }}>
+          {[
+            ["ZUS Społeczne (pełny)", fmt(zusSpoleczne)],
+            [`Składka zdrowotna (bracket ${num(state.taxConfig?.healthBracket)||2})`, fmt(healthIns)],
+            [`Ryczałt ${num(state.taxConfig?.ryczaltRate)||12}% of gross`, fmt(ryczaltTax)],
+          ].map(([label, val]) => (
+            <><span key={label+"l"} style={{ fontSize: 12, color: "#8A6050" }}>{label}</span>
+            <span key={label+"v"} style={{ fontSize: 12, fontFamily: "monospace", color: "#E08060", textAlign: "right" }}>−{val}</span></>
+          ))}
+          <div style={{ gridColumn: "1/-1", borderTop: "1px solid rgba(192,96,64,0.2)", margin: "6px 0" }} />
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#C8DDE5" }}>Total deductions</span>
+          <span style={{ fontSize: 13, fontWeight: 700, fontFamily: "monospace", color: "#E07070", textAlign: "right" }}>−{fmt(totalDeductions)}</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#76C09A" }}>Net take-home (main)</span>
+          <span style={{ fontSize: 13, fontWeight: 700, fontFamily: "monospace", color: "#76C09A", textAlign: "right" }}>{fmt(calculatedSalary)}</span>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 10, color: "#5A4030" }}>
+          VAT 23% = {fmt(vatAmount)} — collected from client, passed through to US via VAT-7, not your money.
+        </div>
+      </div>
+
+      {/* Transfer suggestion */}
+      {(() => {
+        const target = num(state.taxConfig?.transferTarget ?? 20000);
+        const availableAfterCompany = Math.max(0, calculatedSalary - totalCompany);
+        const capped = Math.min(availableAfterCompany, target);
+        const rounded = Math.floor(capped / 250) * 250;
+        const shortfall = target - rounded;
+        const isFullTarget = rounded >= target;
+        const isEmpty = calculatedSalary <= 0;
+        return (
+          <div style={{
+            background: isEmpty ? "rgba(90,90,90,0.08)" : isFullTarget ? "rgba(118,192,154,0.1)" : "rgba(192,160,96,0.1)",
+            border: `1px solid ${isEmpty ? "rgba(90,90,90,0.2)" : isFullTarget ? "rgba(118,192,154,0.35)" : "rgba(192,160,96,0.35)"}`,
+            borderRadius: 12, padding: "16px 18px", marginBottom: 14,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em", color: isEmpty ? "#5A5A5A" : isFullTarget ? "#4A9A6A" : "#9A8040", marginBottom: 2 }}>
+                  💸 Suggested Personal Transfer
+                </div>
+                <div style={{ fontSize: 10, color: isEmpty ? "#4A4A4A" : isFullTarget ? "#2A6A4A" : "#6A5A20" }}>
+                  {isEmpty ? "Enter your hourly rate to calculate" : isFullTarget
+                  ? `Full target reached — ${totalCompany > 0 ? `after ${fmt(totalCompany)} company costs, ` : ""}${fmt(availableAfterCompany)} available`
+                  : `Available after company costs (${fmt(availableAfterCompany)}) is below the ${fmt(target)} target`}
+                </div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontSize: 32, fontWeight: 800, fontFamily: "monospace", lineHeight: 1, color: isEmpty ? "#5A5A5A" : isFullTarget ? "#76C09A" : "#C0A060" }}>
+                  {isEmpty ? "—" : `${rounded.toLocaleString("pl-PL")} zł`}
+                </div>
+                {!isEmpty && <div style={{ fontSize: 10, color: "#5A6A5A", marginTop: 2 }}>rounded to nearest 250 zł</div>}
+              </div>
+            </div>
+            {!isEmpty && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                {[
+                  ["After company costs", fmt(availableAfterCompany), "#C8DDE5"],
+                  ["Transfer target", fmt(target), "#7EB8C9"],
+                  [isFullTarget ? "Stays in business acc." : "Shortfall vs target", fmt(isFullTarget ? availableAfterCompany - rounded : shortfall), isFullTarget ? "#A080C0" : "#E07070"],
+                ].map(([l, v, c]) => (
+                  <div key={l} style={{ background: "rgba(0,0,0,0.15)", borderRadius: 6, padding: "7px 10px" }}>
+                    <div style={{ fontSize: 9, color: "#3A5A6A", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 2 }}>{l}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, fontFamily: "monospace", color: c }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontSize: 10, color: "#3A5A6A" }}>Monthly transfer target:</div>
+              <div style={{ width: 130 }}>
+                <Input value={state.taxConfig?.transferTarget ?? 20000} onChange={v => setState(s => ({ ...s, taxConfig: { ...s.taxConfig, transferTarget: v } }))} prefix="zł" suffix />
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Tax config */}
+      <div style={{ background: "rgba(90,80,130,0.06)", border: "1px solid rgba(90,80,130,0.2)", borderRadius: 10, padding: "12px 16px", marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: "#8A80B0", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>⚙ Tax Configuration</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A5080", marginBottom: 4 }}>Ryczałt Rate (%)</div>
+            <Input value={state.taxConfig?.ryczaltRate ?? 12} onChange={v => setState(s => ({ ...s, taxConfig: { ...s.taxConfig, ryczaltRate: v } }))} prefix="%" suffix placeholder="12" />
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A5080", marginBottom: 4 }}>Health Bracket (1/2/3)</div>
+            <Input value={state.taxConfig?.healthBracket ?? 2} onChange={v => setState(s => ({ ...s, taxConfig: { ...s.taxConfig, healthBracket: Math.min(3,Math.max(1,Math.round(v))) } }))} prefix="#" placeholder="2" />
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: "#5A5080", marginBottom: 4 }}>ZUS Społeczne (zł)</div>
+            <Input value={state.taxConfig?.zusEnabled !== false ? ZUS_SPOLECZNE : 0} onChange={() => {}} prefix="zł" suffix />
+          </div>
+        </div>
+        <div style={{ fontSize: 10, color: "#4A4060", marginTop: 8 }}>
+          Health: bracket 1 = 461.66 zł (&lt;60k/yr) · 2 = 769.43 zł (60k–300k) · 3 = 1,384.97 zł (&gt;300k) — 2025 rates
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 4 }}>
+        {[["partner", "Partner / Secondary Income"], ["other", "Other Income"]].map(([f, l]) => (
+          <div key={f}>
+            <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>{l}</div>
+            <Input value={state.income[f]} onChange={v => update("income", f, v)} prefix="zł" suffix />
+          </div>
+        ))}
+      </div>
+
+      {/* Pay day */}
+      <div style={{ marginBottom: 16, marginTop: 10 }}>
+        <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>Pay Day (day of month)</div>
+        <div style={{ width: 120 }}>
+          <Input value={state.payDay} onChange={v => setState(s => ({ ...s, payDay: v }))} prefix="#" placeholder="1" />
+        </div>
+      </div>
+
+      {/* Overview cards */}
+      <SectionHeader title="Overview" />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+        <StatCard label="Total Income" value={fmt(totalIncome)} color="#7EB8C9" big />
+        <StatCard label="Total Budgeted" value={fmt(totalBudgeted)} color="#C8DDE5" big />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
+        <StatCard label="Housing" value={fmt(totalHousing)} color="#6AAFC0" />
+        <StatCard label="Food" value={fmt(totalFood)} color="#76C09A" />
+        <StatCard label="Regular" value={fmt(totalRegular)} color="#C0A060" />
+        <StatCard label="Savings" value={fmt(totalSavings)} color="#A080C0" />
+      </div>
+      <div style={{
+        padding: "12px 16px", borderRadius: 10, marginBottom: 20,
+        background: remaining >= 0 ? "rgba(118,192,154,0.1)" : "rgba(192,64,64,0.1)",
+        border: `1px solid ${remaining >= 0 ? "rgba(118,192,154,0.3)" : "rgba(192,64,64,0.3)"}`,
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+      }}>
+        <span style={{ fontSize: 13, color: "#5A8090" }}>Unallocated remaining</span>
+        <span style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: remaining >= 0 ? "#76C09A" : "#E07070" }}>
+          {fmt(remaining, true)}
+        </span>
+      </div>
+
+      {/* 50/30/20 */}
+      <SectionHeader title="50 / 30 / 20 Rule" color="#C0A060" />
+      <div style={{ background: "rgba(192,160,96,0.05)", border: "1px solid rgba(192,160,96,0.15)", borderRadius: 10, padding: "14px 16px", marginBottom: 8 }}>
+        <div style={{ fontSize: 11, color: "#7A6040", marginBottom: 14, lineHeight: 1.5 }}>
+          Ideal split of your <strong style={{ color: "#C0A060" }}>total budgeted spend</strong>: <strong style={{ color: "#C0A060" }}>50% Needs</strong> · <strong style={{ color: "#C0A060" }}>30% Wants</strong> · <strong style={{ color: "#C0A060" }}>20% Savings</strong>
+          <span style={{ display: "block", marginTop: 2, fontSize: 10, color: "#5A4030" }}>Needs = Housing + Food · Wants = Regular Spending · Bars show your actual split; marker (│) shows the ideal</span>
+        </div>
+        {totalBudgeted === 0 && (
+          <div style={{ fontSize: 11, color: "#5A4030", fontStyle: "italic", marginBottom: 10 }}>Fill in your expenses to see your budget distribution.</div>
+        )}
+        <SplitBar label="🏠 Needs (Housing + Food)" pct={0.50} budgetPct={needsPct} color="#6AAFC0" />
+        <SplitBar label="🎉 Wants (Regular)" pct={0.30} budgetPct={wantsPct} color="#C0A060" />
+        <SplitBar label="💰 Savings" pct={0.20} budgetPct={savingsPct} color="#A080C0" />
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 14 }}>
+          {[
+            ["Needs", needs, totalBudgeted * 0.5, needsPct, "#6AAFC0"],
+            ["Wants", wants, totalBudgeted * 0.3, wantsPct, "#C0A060"],
+            ["Savings", savingsTotal, totalBudgeted * 0.2, savingsPct, "#A080C0"],
+          ].map(([l, actual, ideal, pct, color]) => {
+            const diff = actual - ideal;
+            return (
+              <div key={l} style={{ background: "rgba(0,0,0,0.2)", borderRadius: 8, padding: "10px 12px" }}>
+                <div style={{ fontSize: 10, color: "#5A8090", marginBottom: 4 }}>{l}</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color, fontFamily: "monospace" }}>{fmt(actual)}</div>
+                <div style={{ fontSize: 10, color: "#3A5A6A", marginTop: 2 }}>ideal {fmt(ideal)}</div>
+                <div style={{ fontSize: 11, fontFamily: "monospace", marginTop: 4, color: diff > 0 ? "#E07070" : "#76C09A" }}>
+                  {fmt(diff, true)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+    );
+  };
+
+  // ── Smart section renderer ──
+  const renderSection = (sectionKey, groups, accentColor, total, totalLabel, footerNote) => {
+    const showZeroKey = `showZeros_${sectionKey}`;
+    const showZeros = state.showZeros?.[showZeroKey] || false;
+    const toggleShowZeros = () => setState(s => ({
+      ...s, showZeros: { ...s.showZeros, [showZeroKey]: !showZeros }
+    }));
+    const zeroCount = groups.reduce((n, g) =>
+      n + g.items.filter(([f]) => num(state[sectionKey]?.[f]) === 0).length, 0);
+    const nonZeroCount = groups.reduce((n, g) =>
+      n + g.items.filter(([f]) => num(state[sectionKey]?.[f]) > 0).length, 0);
+
+    return (
+      <div>
+        {groups.map(({ title, color, items }) => (
+          <div key={title}>
+            <SectionHeader title={title} color={color || accentColor} />
+            {items.map(([f, l, n]) => (
+              <SmartRow key={f} defaultLabel={l} field={f} section={sectionKey}
+                state={state} setState={setState} note={n} showZero={showZeros} />
+            ))}
+          </div>
+        ))}
+        <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          {zeroCount > 0 && (
+            <button onClick={toggleShowZeros} style={{
+              fontSize: 11, color: showZeros ? "#7EB8C9" : "#3A6A7A",
+              background: "rgba(126,184,201,0.06)", border: "1px solid rgba(126,184,201,0.15)",
+              borderRadius: 6, padding: "5px 10px", cursor: "pointer",
+            }}>
+              {showZeros ? `▲ Hide ${zeroCount} empty line${zeroCount !== 1 ? "s" : ""}` : `▼ Show ${zeroCount} empty line${zeroCount !== 1 ? "s" : ""}`}
+            </button>
+          )}
+          {nonZeroCount === 0 && !showZeros && (
+            <span style={{ fontSize: 11, color: "#2A4A5A", fontStyle: "italic" }}>No entries yet — click "Show empty lines" to start.</span>
+          )}
+          <div style={{ marginLeft: "auto", padding: "7px 14px", background: `${accentColor}14`, borderRadius: 8, display: "flex", gap: 12, alignItems: "center" }}>
+            <span style={{ color: accentColor, fontSize: 13 }}>{totalLabel}</span>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, color: accentColor }}>{fmt(total)}</span>
+          </div>
+        </div>
+        {footerNote && (
+          <div style={{ marginTop: 8, padding: "10px 14px", background: "rgba(118,192,154,0.06)", borderRadius: 8, fontSize: 11, color: "#3A6A7A", lineHeight: 1.6 }}>
+            {footerNote}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderCompany = () => renderSection("company", [{
+    title: "Office & Operations", items: [
+      ["accountancy", "Accountancy / Bookkeeper", "Monthly retainer"],
+      ["bankFees", "Bank Fees", "Business account charges"],
+      ["officeRent", "Office / Coworking Space", ""],
+      ["phone", "Phone Plan", "Business mobile"],
+      ["internet", "Internet (business)", ""],
+      ["software", "Software & Subscriptions", "Tools, SaaS, licences"],
+      ["hosting", "Hosting & Infrastructure", "Servers, domains, cloud"],
+      ["equipment", "Equipment & Hardware", "Amortised monthly"],
+      ["insurance", "Business Insurance", "OC, majątkowe etc."],
+      ["marketing", "Marketing & Ads", ""],
+      ["training", "Training & Courses", "Professional development"],
+      ["travel", "Business Travel", "Trains, flights"],
+      ["fuel", "Fuel / Transport", "Business use"],
+      ["meals", "Client Meals / Entertainment", ""],
+      ["other1", "Other Company Cost 1", ""],
+      ["other2", "Other Company Cost 2", ""],
+    ]
+  }], "#7EB8C9", totalCompany, "Total Company Expenses",
+    "Paid from your business account before your personal transfer. Automatically deducted from the transfer suggestion on the dashboard.");
+
+  const renderHousing = () => renderSection("housing", [
+    { title: "Housing & Home", color: "#6AAFC0", items: [
+      ["rent", "Rent / Mortgage", "Primary housing cost"],
+      ["propertyTax", "Property Tax", "Annual ÷ 12"],
+      ["homeInsurance", "Home Insurance", "Annual ÷ 12"],
+      ["electricity", "Electricity", ""],
+      ["gas", "Gas / Heating", ""],
+      ["water", "Water", ""],
+      ["internet", "Internet", ""],
+      ["maintenance", "Home Maintenance", "Repairs, cleaning"],
+      ["furniture", "Furniture / Appliances", "Amortised monthly"],
+      ["otherHousing", "Other Housing Cost", ""],
+    ]},
+    { title: "Transport", color: "#6AAFC0", items: [
+      ["carLoan", "Car Loan / Lease", ""],
+      ["fuel", "Fuel", ""],
+      ["carInsurance", "Car Insurance", "Annual ÷ 12"],
+      ["roadTax", "Road Tax", "Annual ÷ 12"],
+      ["publicTransport", "Public Transport", "Monthly pass"],
+      ["parking", "Parking", ""],
+      ["carService", "Car Servicing", "Annual estimate ÷ 12"],
+    ]},
+  ], "#6AAFC0", totalHousing, "Total Housing & Transport");
+
+  const renderFood = () => renderSection("food", [
+    { title: "Groceries & Food", color: "#76C09A", items: [
+      ["groceries", "Weekly Groceries × 4", "Supermarket, market"],
+      ["kidsFood", "Baby / Kids Food", "Formula, snacks, school lunch"],
+      ["specialty", "Specialty / Organic", "Health food stores"],
+      ["mealKits", "Meal Kits / Delivery", "HelloFresh, Takeaway"],
+      ["coffee", "Coffee & Bakeries", "Daily coffee, pastries"],
+      ["restaurants", "Restaurants & Dining Out", "Family meals, date nights"],
+      ["workLunches", "Work Lunches", ""],
+      ["alcohol", "Alcohol / Wine", ""],
+      ["otherFood", "Other Food / Drink", ""],
+    ]},
+  ], "#76C09A", totalFood, "Total Food & Groceries");
+
+  const renderRegular = () => renderSection("regular", [
+    { title: "Subscriptions", color: "#C0A060", items: [
+      ["streamingVideo", "Streaming — Video", "Netflix, Disney+…"],
+      ["streamingMusic", "Streaming — Music", "Spotify, Apple Music…"],
+      ["gaming", "Gaming / Apps", "Xbox, App Store"],
+      ["news", "News / Magazines", ""],
+      ["cloud", "Cloud Storage", "iCloud, Google…"],
+      ["software", "Software / SaaS", "Adobe, Office 365…"],
+      ["gym", "Gym / Fitness App", ""],
+      ["sub8", "Other Subscription 1", ""],
+      ["sub9", "Other Subscription 2", ""],
+    ]},
+    { title: "Extracurricular — Adults", color: "#C0A060", items: [
+      ["sportsAdult", "Sports / Hobby Club", "Football, tennis…"],
+      ["classesAdult", "Classes / Courses", "Language, yoga…"],
+      ["eventsAdult", "Events / Concerts", "Average monthly"],
+      ["otherAdult", "Other Adult Activity", ""],
+    ]},
+    { title: "Extracurricular — Children", color: "#C0A060", items: [
+      ["schoolFees", "School Fees / Tuition", ""],
+      ["afterSchool", "After-School Care", ""],
+      ["sportsKid1", "Sports / Clubs (child 1)", ""],
+      ["sportsKid2", "Sports / Clubs (child 2)", ""],
+      ["musicArts", "Music / Arts Lessons", ""],
+      ["schoolTrips", "School Trips / Outings", "Average monthly"],
+      ["otherKids", "Other Kids Activity", ""],
+    ]},
+    { title: "Personal & Miscellaneous", color: "#C0A060", items: [
+      ["clothing", "Clothing & Shoes", "Family estimate"],
+      ["haircuts", "Haircuts / Grooming", ""],
+      ["healthcare", "Healthcare / Pharmacy", "Prescriptions"],
+      ["gifts", "Gifts & Celebrations", "Birthdays ÷ 12"],
+      ["pets", "Pet Care", "Food, vet, grooming"],
+      ["otherMisc", "Other Misc.", ""],
+    ]},
+  ], "#C0A060", totalRegular, "Total Regular Spending");
+
+  const renderSavings = () => {
+    const showZeroKey = "showZeros_savings";
+    const showZerosS = state.showZeros?.[showZeroKey] || false;
+    const toggleShowZerosS = () => setState(s => ({ ...s, showZeros: { ...s.showZeros, [showZeroKey]: !showZerosS } }));
+
+    const goalItems = [
+      ["emergency", "Emergency Fund"], ["holiday", "Holiday / Travel"],
+      ["renovation", "Home Renovation"], ["car", "New Car"],
+      ["education", "Children's Education"], ["retirement", "Retirement / Pension"],
+      ["gadget", "New Gadget / Purchase"], ["goal8", "Goal 8"], ["goal9", "Goal 9"], ["goal10", "Goal 10"],
+    ];
+    const invItems = [
+      ["indexFund", "Index Fund / ETF", "S&P 500, MSCI World"],
+      ["stocks", "Stocks", ""], ["pension", "Pension / Retirement", "Company or private"],
+      ["otherInv", "Other Investment", ""],
+    ];
+    const allItems = [...goalItems.map(([f,l]) => [f,l,""]), ...invItems];
+    const zeroCount = allItems.filter(([f]) => num(state.savings?.[f]) === 0).length;
+    const nonZeroGoals = goalItems.filter(([f]) => num(state.savings?.[f]) > 0);
+    const nonZeroInv   = invItems.filter(([f])  => num(state.savings?.[f]) > 0);
+
+    return (
+      <div>
+        <SectionHeader title="Savings Goals" color="#A080C0" />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 100px 120px 26px", gap: 6, marginBottom: 4 }}>
+          <span style={{ fontSize: 10, color: "#5A8090", textTransform: "uppercase", letterSpacing: "0.08em" }}>Goal</span>
+          <span style={{ fontSize: 10, color: "#5A8090", textTransform: "uppercase", letterSpacing: "0.08em" }}>Monthly</span>
+          <span style={{ fontSize: 10, color: "#5A8090", textTransform: "uppercase", letterSpacing: "0.08em" }}>Target (zł)</span>
+          <span />
+        </div>
+        {goalItems.map(([f, defaultL]) => <SavingsGoalRow key={f} f={f} defaultL={defaultL} state={state} setState={setState} update={update} showZero={showZerosS} />)}
+
+        <SectionHeader title="Investments & Long-term" color="#A080C0" />
+        {invItems.map(([f, l, n]) => (
+          <SmartRow key={f} defaultLabel={l} field={f} section="savings" state={state} setState={setState} note={n} showZero={showZerosS} />
+        ))}
+
+        <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+          {zeroCount > 0 && (
+            <button onClick={toggleShowZerosS} style={{ fontSize: 11, color: showZerosS ? "#A080C0" : "#5A5080", background: "rgba(160,128,192,0.06)", border: "1px solid rgba(160,128,192,0.15)", borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}>
+              {showZerosS ? `▲ Hide ${zeroCount} empty lines` : `▼ Show ${zeroCount} empty lines`}
+            </button>
+          )}
+          <div style={{ marginLeft: "auto", padding: "7px 14px", background: "rgba(160,128,192,0.08)", borderRadius: 8, display: "flex", gap: 12, alignItems: "center" }}>
+            <span style={{ color: "#A080C0", fontSize: 13 }}>Total Savings & Investments</span>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#A080C0" }}>{fmt(totalSavings)}</span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSafeToSpend = () => {
+    const nextPayStr = nextPayDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+
+    const togglePaid = (id, fullAmount) => {
+      setState(s => {
+        const current = s.safeToSpend.paidItems || {};
+        if (current[id]) {
+          const { [id]: _, ...rest } = current;
+          return { ...s, safeToSpend: { ...s.safeToSpend, paidItems: rest } };
+        }
+        return { ...s, safeToSpend: { ...s.safeToSpend, paidItems: { ...current, [id]: { full: true } } } };
+      });
+    };
+
+    const setPartial = (id, value) => {
+      setState(s => {
+        const current = s.safeToSpend.paidItems || {};
+        if (!value) {
+          const { [id]: _, ...rest } = current;
+          return { ...s, safeToSpend: { ...s.safeToSpend, paidItems: rest } };
+        }
+        return { ...s, safeToSpend: { ...s.safeToSpend, paidItems: { ...current, [id]: { partial: value } } } };
+      });
+    };
+
+    const categories = [...new Set(BUDGET_ITEMS.map(i => i.category))];
+    const paidCount = Object.keys(paidItems).length;
+
+    return (
+      <div>
+        {/* Top stats */}
+        <SectionHeader title="Safe to Spend Calculator" color="#7EB8C9" />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 11, color: "#5A8090", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.08em" }}>Bank Balance</div>
+            <Input value={state.safeToSpend.bankBalance} onChange={v => update("safeToSpend", "bankBalance", v)} prefix="zł" suffix />
+          </div>
+          <StatCard label="Next Pay Day" value={nextPayStr} color="#7EB8C9" sub={`${daysUntilPay} days away`} />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
+          <StatCard label="Already Paid" value={fmt(totalAlreadyPaid)} color="#76C09A" sub={`${paidCount} item${paidCount !== 1 ? "s" : ""} ticked`} />
+          <StatCard label="Still Reserved" value={fmt(proRatedUntilPay)} color="#C0A060" sub="pro-rated unpaid costs" />
+          <StatCard label="Unpaid Fixed/day" value={fmt(dailyFixedCosts)} color="#C8DDE5" sub="housing + food + savings" />
+        </div>
+
+        {/* Safe to spend hero */}
+        <div style={{
+          background: safePerDay > 0 ? "rgba(118,192,154,0.1)" : "rgba(192,64,64,0.1)",
+          border: `1px solid ${safePerDay > 0 ? "rgba(118,192,154,0.35)" : "rgba(192,64,64,0.35)"}`,
+          borderRadius: 12, padding: "20px", marginBottom: 16, textAlign: "center",
+        }}>
+          <div style={{ fontSize: 11, color: safePerDay > 0 ? "#4A9A6A" : "#9A4040", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>✦ Safe to Spend Today</div>
+          <div style={{ fontSize: 48, fontWeight: 800, fontFamily: "monospace", color: safePerDay > 0 ? "#76C09A" : "#E07070", lineHeight: 1 }}>{fmt(safePerDay)}</div>
+          <div style={{ fontSize: 12, color: "#3A7A5A", marginTop: 6 }}>per day until {nextPayStr}</div>
+          <div style={{ fontSize: 11, color: "#2A5A3A", marginTop: 4 }}>{fmt(safeTotal)} total free buffer</div>
+        </div>
+
+        {safePerDay <= 0 && (
+          <div style={{ background: "rgba(192,64,64,0.1)", border: "1px solid rgba(192,64,64,0.3)", borderRadius: 8, padding: "12px 14px", fontSize: 12, color: "#E07070", lineHeight: 1.5, marginBottom: 16 }}>
+            ⚠️ Your balance may not fully cover planned expenses before pay day.
+          </div>
+        )}
+
+        {/* Payments checklist */}
+        <SectionHeader title="Monthly Payments Checklist" color="#7EB8C9" />
+        <div style={{ fontSize: 11, color: "#3A6A7A", marginBottom: 12, lineHeight: 1.5 }}>
+          Tick items as you pay them. Paid items are removed from the reserved amount above. Resets automatically each month.
+        </div>
+
+        {BUDGET_ITEMS.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#3A5A6A", fontStyle: "italic" }}>No budget items set yet — fill in your expense tabs first.</div>
+        ) : categories.map(cat => {
+          const items = BUDGET_ITEMS.filter(i => i.category === cat);
+          const catPaid = items.filter(i => paidItems[i.id]).reduce((s, i) => {
+            const p = paidItems[i.id];
+            return s + (p.partial !== undefined ? num(p.partial) : i.amount);
+          }, 0);
+          const catTotal = items.reduce((s, i) => s + i.amount, 0);
+          return (
+            <div key={cat} style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, paddingBottom: 4, borderBottom: "1px solid rgba(126,184,201,0.15)" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#7EB8C9", textTransform: "uppercase", letterSpacing: "0.1em" }}>{cat}</span>
+                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#5A8090" }}>{fmt(catPaid)} / {fmt(catTotal)}</span>
+              </div>
+              {items.map(item => {
+                const paid = paidItems[item.id];
+                const isFullyPaid = paid && paid.full;
+                const partialVal = paid && paid.partial !== undefined ? paid.partial : "";
+                return (
+                  <div key={item.id} style={{
+                    display: "grid", gridTemplateColumns: "28px 1fr 110px 90px", gap: 6, alignItems: "center",
+                    padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.03)",
+                    opacity: isFullyPaid ? 0.5 : 1, transition: "opacity 0.2s",
+                  }}>
+                    {/* Tick button */}
+                    <button onClick={() => togglePaid(item.id, item.amount)} style={{
+                      width: 22, height: 22, borderRadius: 5, border: `1px solid ${isFullyPaid ? "#76C09A" : "rgba(126,184,201,0.3)"}`,
+                      background: isFullyPaid ? "rgba(118,192,154,0.25)" : "transparent",
+                      cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                      color: "#76C09A", fontSize: 12, flexShrink: 0,
+                    }}>
+                      {isFullyPaid ? "✓" : ""}
+                    </button>
+                    {/* Label */}
+                    <span style={{ fontSize: 12, color: isFullyPaid ? "#3A6A5A" : "#C8DDE5", textDecoration: isFullyPaid ? "line-through" : "none" }}>
+                      {item.label}
+                    </span>
+                    {/* Partial amount input */}
+                    <div style={{ opacity: isFullyPaid ? 0.3 : 1 }}>
+                      <Input
+                        value={partialVal}
+                        onChange={v => setPartial(item.id, v)}
+                        prefix="zł" suffix
+                        placeholder={item.amount.toLocaleString("pl-PL", {minimumFractionDigits:2,maximumFractionDigits:2})}
+                      />
+                    </div>
+                    {/* Full amount badge */}
+                    <span style={{ fontSize: 11, fontFamily: "monospace", color: "#3A6A7A", textAlign: "right" }}>
+                      {fmt(item.amount)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+
+        {paidCount > 0 && (
+          <button onClick={() => setState(s => ({ ...s, safeToSpend: { ...s.safeToSpend, paidItems: {} } }))}
+            style={{ marginTop: 8, padding: "6px 14px", fontSize: 11, color: "#5A4040", background: "rgba(192,64,64,0.08)", border: "1px solid rgba(192,64,64,0.2)", borderRadius: 6, cursor: "pointer" }}>
+            Reset all ticks
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renders = [renderDashboard, renderCompany, renderHousing, renderFood, renderRegular, renderSavings, renderSafeToSpend];
+
+  return (
+    <div style={styles.app}>
+      <div style={styles.header}>
+        <div style={styles.title}>Budget Planner</div>
+        <div style={styles.subtitle}>Monthly financial overview</div>
+        <div style={styles.tabs}>
+          {TABS.map((t, i) => (
+            <button key={t} onClick={() => setTab(i)} style={styles.tab(tab === i)}>
+              <span style={{ marginRight: 5, opacity: 0.7 }}>{TAB_ICONS[i]}</span>{t}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div style={styles.body}>
+        {renders[tab]()}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+
+function Root() {
+  const [appState, setAppState] = useState(() => {
+    try {
+      const saved = localStorage.getItem("budget-planner-v1");
+      if (saved) return { ...defaultState, ...JSON.parse(saved) };
+    } catch {}
+    return defaultState;
+  });
+  const sync = useSync(appState, setAppState);
+  return (
+    <>
+      <SyncBar user={sync.user} status={sync.status} signIn={sync.signIn} signOut={sync.signOut} conflict={sync.conflict} resolveConflict={sync.resolveConflict} />
+      <App __externalState__={appState} __externalSetState__={setAppState} />
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
+</script>
+</body>
+</html>
